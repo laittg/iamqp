@@ -1,0 +1,22 @@
+{
+  "name": "iamqp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laittg/iamqp.git"
+  },
+  "author": "Laittg",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/laittg/iamqp/issues"
+  },
+  "homepage": "https://github.com/laittg/iamqp#readme",
+  "dependencies": {
+    "amqplib": "^0.5.2"
+  }
+}
