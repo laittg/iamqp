@@ -1,5 +1,4 @@
 // Credit to https://gist.github.com/carlhoerberg/006b01ac17a0a94859ba
-// @Laittg
 
 var amqp = require('amqplib/callback_api')
 
@@ -8,7 +7,15 @@ module.exports = IAMQP
 function IAMQP (cfg) {
   var iam = this
 
+  var con = cfg.connection
+  con.cluster = con.cluster || []
+  if (con.hostname) {
+    con.cluster.push(con.hostname)
+  }
+
   iam.config = cfg
+
+  iam.nextHost = 0
 
   // the connection
   iam.amqpConn = null
@@ -31,9 +38,29 @@ function IAMQP (cfg) {
  */
 IAMQP.prototype.start = function () {
   var iam = this
+  // round robin cluster
+  var con = iam.config.connection
+  con.hostname = con.cluster[iam.nextHost]
+  iam.nextHost++
+  if (iam.nextHost >= con.cluster.length) {
+    iam.nextHost = 0
+  }
   amqp.connect(iam.config.connection, iam.config.sockOpts, function (err, conn) {
     // if the connection is closed or fails to be established at all, we will reconnect
-    if (iam.closeOnErr(err, 'Starting')) return
+    if (err) {
+      console.error('[AMQP]', err.message)
+      return setTimeout(() => { iam.start() }, 1000)
+    }
+    conn.on('error', function (err) {
+      if (err.message !== 'Connection closing') {
+        console.error('[AMQP] conn error', err.message)
+      }
+    })
+    conn.on('close', function () {
+      console.error('[AMQP] connection closed')
+      iam.amqpConn = null
+      return setTimeout(() => { iam.start() }, 1000)
+    })
 
     console.log('[AMQP] connected')
     iam.amqpConn = conn
@@ -47,15 +74,10 @@ IAMQP.prototype.start = function () {
  * Close the connection on error
  * @param {*} err
  */
-IAMQP.prototype.closeOnErr = function (err, type) {
-  var iam = this
+IAMQP.prototype.closeOnErr = function (err) {
   if (!err) return false
-
-  console.error('[AMQP] Error', type || '', err)
-  iam.amqpConn.close()
-
-  console.log('[AMQP]', 'Restart')
-  iam.start()
+  console.error('[AMQP] error', err)
+  this.amqpConn.close()
   return true
 }
 
@@ -65,7 +87,13 @@ IAMQP.prototype.closeOnErr = function (err, type) {
 IAMQP.prototype.startPublisher = function () {
   var iam = this
   iam.amqpConn.createConfirmChannel(function (err, ch) {
-    if (iam.closeOnErr(err, 'Publisher createConfirmChannel')) return
+    if (iam.closeOnErr(err)) return
+    ch.on('error', function (err) {
+      console.error('[AMQP] pub-channel error', err.message)
+    })
+    ch.on('close', function () {
+      console.log('[AMQP] pub-channel closed')
+    })
 
     console.log('[AMQP] pub-channel opened')
     iam.pubChannel = ch
@@ -87,7 +115,7 @@ IAMQP.prototype.startPublisher = function () {
  * @param {string} routingKey
  * @param {*} content
  */
-IAMQP.prototype.publish = function (exchange, routingKey, content) {
+IAMQP.prototype.publish = function (exchange, routingKey, content, done) {
   var iam = this
   var ctype = typeof content
   var message
@@ -101,19 +129,23 @@ IAMQP.prototype.publish = function (exchange, routingKey, content) {
   }
 
   // queue the message when disconnected
-  if (iam.amqpConn === null) return iam.offlinePubQueue.push([exchange, routingKey, message])
+  if (iam.amqpConn === null || !iam.pubChannel) {
+    return iam.offlinePubQueue.push([exchange, routingKey, message])
+  }
 
-  iam.pubChannel.publish(exchange, routingKey, Buffer.from(message), { persistent: true },
-    function (err, ok) {
-      if (err) {
-        if (err.message.indexOf('NOT-FOUND') === -1) {
-          // only requeue if err is not NOT-FOUND of key or exchange
+  try {
+    iam.pubChannel.publish(exchange, routingKey, Buffer.from(message), { persistent: true },
+      function (err, ok) {
+        setImmediate(done, err)
+        if (err) {
           iam.offlinePubQueue.push([exchange, routingKey, message])
+          iam.pubChannel.connection.close()
         }
-        iam.pubChannel.connection.close()
-        iam.closeOnErr(err, 'Publishing')
-      }
-    })
+      })
+  } catch (e) {
+    setImmediate(done, e)
+    iam.offlinePubQueue.push([exchange, routingKey, message])
+  }
 }
 
 /**
@@ -124,24 +156,27 @@ IAMQP.prototype.publish = function (exchange, routingKey, content) {
 IAMQP.prototype.startConsumer = function (queue, work) {
   var iam = this
   iam.amqpConn.createChannel(function (err, ch) {
-    if (iam.closeOnErr(err, 'Consumer createChannel')) return
+    if (iam.closeOnErr(err)) return
     ch.on('error', function (err) {
-      iam.closeOnErr(err, 'Consumer')
+      console.error('[AMQP] sub-channel error', err.message)
+    })
+    ch.on('close', function () {
+      console.log('[AMQP] sub-channel closed')
     })
 
     console.log('[AMQP] sub-channel opened for queue', queue)
     ch.prefetch(10)
 
     ch.assertQueue(queue, { durable: true }, function (err, _ok) {
-      if (iam.closeOnErr(err, 'Consumer assertQueue')) return
+      if (iam.closeOnErr(err)) return
       ch.consume(queue, processMsg, { noAck: false })
       console.log('Worker is started to handle messages in queue', queue)
     })
 
     function processMsg (msg) {
-      work(msg, function (ok) {
+      work(msg.content.toString(), function (err, result) {
         try {
-          if (ok) { ch.ack(msg) } else { ch.reject(msg, true) }
+          if (!err) { ch.ack(msg) } else { ch.reject(msg, true) }
         } catch (e) {
           iam.closeOnErr(e)
         }
